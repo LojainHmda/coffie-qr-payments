@@ -1,0 +1,19 @@
+# Never let real credentials into the build context or the image.
+.env
+.env.*
+!.env.local.example
+
+node_modules
+.next
+out
+build
+coverage
+.git
+.gitignore
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+.DS_Store
+README.md
+tests
+vitest.config.mts
