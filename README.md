@@ -380,6 +380,36 @@ source of truth.
 
 ---
 
+## Deployment (Google Cloud Run)
+
+Live: `https://coffie-qr-payments-530422771583.us-central1.run.app`
+Project `kartacagenai`, region `us-central1`.
+
+```bash
+gcloud run deploy coffie-qr-payments --source .   --project kartacagenai --region us-central1   --allow-unauthenticated --port 8080   --min-instances 1 --max-instances 1 --memory 512Mi   --set-env-vars "AFS_BASE_URL=https://eu-test.oppwa.com/,AFS_CURRENCY=AED"
+```
+
+`--min-instances 1 --max-instances 1` is **not** a performance setting, it is a
+correctness one. Orders and payments live in memory (see `lib/store/memory.ts`),
+so a second container would not see orders created by the first and the payment
+flow would fail on its second step. Do not raise `--max-instances` until a real
+database replaces the in-memory store. One instance also means state is lost
+whenever Cloud Run replaces the container — a deploy, a health event, an infra
+move — so treat the order history as demo data, not records.
+
+Credentials are never committed and never baked into the image:
+
+- `AFS_ACCESS_TOKEN` comes from Secret Manager (`afs-access-token`).
+- `AFS_ENTITY_ID`, `AFS_BASE_URL`, `AFS_CURRENCY` are plain env vars.
+- `.gcloudignore` and `.dockerignore` both exclude every `.env*` file except
+  the placeholder example, so `.env.local` cannot reach a build context.
+
+`shopperResultUrl` and the QR codes need no configuration: both are derived from
+the `Host`/`X-Forwarded-*` headers, so they resolve to the public https URL
+automatically. `APP_BASE_URL` / `QR_BASE_URL` override that if ever needed.
+
+---
+
 ## Before this can go to production
 
 1. Real AFS production credentials and `AFS_BASE_URL` (currently the TEST host),

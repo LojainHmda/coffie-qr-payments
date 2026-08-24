@@ -1,0 +1,21 @@
+# What gcloud must NOT upload to Cloud Build.
+#
+# Explicit on purpose: without this file gcloud derives its exclusions from
+# .gitignore, and a change there would silently start shipping local secrets
+# into a build context.
+
+.env
+.env.*
+!.env.local.example
+
+.git
+.gitignore
+node_modules
+.next
+out
+build
+coverage
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+.DS_Store
