@@ -53,7 +53,7 @@ export default async function OrdersPage({ searchParams }: PageProps<"/admin/ord
           </p>
           <nav className="mt-3 text-sm">
             <Link href="/admin/machines" className="underline underline-offset-4">
-              Machine QR codes
+              Machines
             </Link>
           </nav>
         </header>
@@ -86,7 +86,7 @@ export default async function OrdersPage({ searchParams }: PageProps<"/admin/ord
 
         {orders.length === 0 ? (
           <p className="rounded-2xl border border-black/10 bg-white p-8 text-center text-sm text-black/50 dark:border-white/15 dark:bg-neutral-900 dark:text-white/50">
-            No orders yet. Scan a machine QR and buy something.
+            No orders yet. Open a machine screen, choose a drink, and scan the code it prints.
           </p>
         ) : (
           <div className="overflow-x-auto rounded-2xl border border-black/10 bg-white shadow-sm dark:border-white/15 dark:bg-neutral-900">
@@ -95,7 +95,7 @@ export default async function OrdersPage({ searchParams }: PageProps<"/admin/ord
                 <tr>
                   <Th>Order</Th>
                   <Th>Machine</Th>
-                  <Th>Product</Th>
+                  <Th>Items</Th>
                   <Th>Amount</Th>
                   <Th>Method</Th>
                   <Th>Provider</Th>
@@ -112,7 +112,6 @@ export default async function OrdersPage({ searchParams }: PageProps<"/admin/ord
                   const payment =
                     attempts.find((entry) => entry.status === PaymentStatus.SUCCESS) ??
                     attempts.at(-1);
-                  const item = order.items[0];
 
                   return (
                     <tr
@@ -121,7 +120,17 @@ export default async function OrdersPage({ searchParams }: PageProps<"/admin/ord
                     >
                       <Td className="font-medium">#{order.orderNumber}</Td>
                       <Td>{machine?.code ?? order.machineId}</Td>
-                      <Td>{item?.productName ?? "—"}</Td>
+                      <Td>
+                        {order.items.length === 0
+                          ? "—"
+                          : order.items
+                              .map((item) =>
+                                item.quantity > 1
+                                  ? `${item.productName} × ${item.quantity}`
+                                  : item.productName,
+                              )
+                              .join(", ")}
+                      </Td>
                       <Td className="tabular-nums">
                         {order.currency} {order.total}
                       </Td>

@@ -2,16 +2,23 @@
 
 import { useCallback, useEffect, useState } from "react";
 
+import type { OrderItem } from "@/lib/orders/order";
 import { PAYMENT_METHOD_LABEL, PaymentMethod } from "@/lib/payments/payment";
-import { useAvailablePaymentMethods } from "./useAvailablePaymentMethods";
+import type { WalletClientConfig } from "@/lib/payments/wallets";
+import { useAvailablePaymentMethods, type WalletUnavailableReason } from "./useAvailablePaymentMethods";
+import { buildWpwlOptions } from "./wpwlOptions";
 
 /**
  * Customer payment step.
  *
+ * The order already exists: the customer built it on the machine, the machine
+ * asked our server to price it, and the QR they scanned carries that order's
+ * pay token. So this component creates nothing — it shows what is owed and
+ * starts a checkout for it.
+ *
  * Card details are collected entirely by the AFS Copy&Pay widget inside the
  * `form.paymentWidgets` element. This component never sees, holds or transmits
- * card data: it asks our backend for an order and a checkout id, then lets the
- * AFS script take over.
+ * card data.
  */
 
 interface CheckoutResponse {
@@ -50,49 +57,62 @@ const METHOD_PRESENTATION: Record<PaymentMethod, { icon: string; label: string; 
   CARD: { icon: "💳", label: "Pay with Card", primary: false },
 };
 
-export function PayCheckout({
-  machineToken,
-  productId,
-  productName,
-  price,
-  currency,
-  enabledMethods,
-}: {
-  machineToken: string;
-  productId: string;
-  productName: string;
-  /** Display only. The server reads the real price from the catalogue. */
-  price: string;
+/**
+ * One honest sentence per missing wallet. A button that is not there is
+ * explained rather than left as a silent gap the customer has to guess about.
+ */
+function walletNote(method: PaymentMethod, reason: WalletUnavailableReason): string | null {
+  const label = PAYMENT_METHOD_LABEL[method];
+  switch (reason) {
+    case "NOT_ENABLED":
+      return `${label} is not enabled on this merchant account yet.`;
+    case "INSECURE_CONTEXT":
+      return `${label} needs a secure https connection, so it cannot appear on this address.`;
+    case "NO_CARD":
+      return `${label} is set up on this device but has no card that can pay on the web.`;
+    case "UNSUPPORTED_DEVICE":
+      return `${label} is not supported by this browser or device.`;
+    default:
+      return null;
+  }
+}
+
+export interface PayOrderSummary {
+  orderNumber: number;
+  items: OrderItem[];
+  /** Display only. The server re-reads the real total from the order. */
+  total: string;
   currency: string;
+}
+
+export function PayCheckout({
+  payToken,
+  order,
+  enabledMethods,
+  wallets,
+}: {
+  payToken: string;
+  order: PayOrderSummary;
   enabledMethods: PaymentMethod[];
+  /** Apple Pay / Google Pay widget configuration, built server-side. */
+  wallets: WalletClientConfig;
 }) {
   const [phase, setPhase] = useState<Phase>("choosing");
   const [checkout, setCheckout] = useState<CheckoutResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const { methods, resolved } = useAvailablePaymentMethods(enabledMethods);
+  const { methods, resolved, reasons } = useAvailablePaymentMethods(enabledMethods, wallets);
 
   const pay = useCallback(
     async (method: PaymentMethod) => {
       setPhase("starting");
       setError(null);
       try {
-        // 1. The server builds the order and decides the amount from the
-        //    catalogue. We send only which machine and which product.
-        const orderResponse = await fetch("/api/v1/orders", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ machineToken, productId }),
-        });
-        const order = (await orderResponse.json()) as { orderId?: string } & ErrorResponse;
-        if (!orderResponse.ok || !order.orderId) {
-          throw new Error(order.error ?? "Could not start your order.");
-        }
-
-        // 2. The server creates the AFS checkout for that order.
+        // One request, and it names neither a price nor a product: the token
+        // resolves server-side to the order the machine already priced.
         const checkoutResponse = await fetch("/api/v1/payments/checkout", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ machineToken, orderId: order.orderId, method }),
+          body: JSON.stringify({ payToken, method }),
         });
         const body = (await checkoutResponse.json()) as CheckoutResponse & ErrorResponse;
         if (!checkoutResponse.ok || !body.checkoutId) {
@@ -107,7 +127,7 @@ export function PayCheckout({
         setPhase("error");
       }
     },
-    [machineToken, productId],
+    [payToken],
   );
 
   // Load the AFS widget script exactly once per checkout, after the
@@ -122,7 +142,20 @@ export function PayCheckout({
     if (!checkout) return;
     if (document.querySelector(`script[${SCRIPT_MARKER}]`)) return;
 
-    window.wpwlOptions = { locale: "en", style: "card" };
+    // Must be set BEFORE the widget script loads: the widget reads this global
+    // once at boot. For a wallet it carries the payment-sheet configuration —
+    // Apple's total and supportedNetworks, Google's mandatory
+    // gatewayMerchantId — without which the button either never renders or
+    // renders and then fails when tapped.
+    //
+    // The amount and currency come from the checkout the server created, not
+    // from the total this page rendered, so the Apple Pay sheet shows exactly
+    // what AFS will charge.
+    window.wpwlOptions = buildWpwlOptions(checkout.method, checkout, wallets, {
+      // The customer dismissed the wallet sheet. Not an error: leave the form
+      // in place so they can tap the button again or cancel out.
+      onCancel: () => {},
+    });
 
     const script = document.createElement("script");
     script.src = checkout.widgetScriptUrl;
@@ -138,7 +171,7 @@ export function PayCheckout({
     };
 
     document.body.appendChild(script);
-  }, [checkout]);
+  }, [checkout, wallets]);
 
   /** Full page load, not a state reset: the AFS globals must not be reused. */
   const startOver = () => window.location.reload();
@@ -146,12 +179,32 @@ export function PayCheckout({
   return (
     <>
       <div className="rounded-2xl border border-black/10 bg-white p-5 shadow-sm dark:border-white/15 dark:bg-neutral-900">
-        <p className="text-xs tracking-wide text-black/50 uppercase dark:text-white/50">You are buying</p>
-        <div className="mt-2 flex items-baseline justify-between gap-4">
-          <h1 className="text-2xl font-semibold tracking-tight">{productName}</h1>
-          <p className="shrink-0 text-2xl font-semibold tabular-nums">
-            {currency} {price}
+        <div className="flex items-baseline justify-between gap-4">
+          <p className="text-xs tracking-wide text-black/50 uppercase dark:text-white/50">
+            Your order
           </p>
+          <p className="text-xs text-black/50 dark:text-white/50">#{order.orderNumber}</p>
+        </div>
+
+        <ul className="mt-3 space-y-2">
+          {order.items.map((item) => (
+            <li key={item.productId} className="flex items-baseline justify-between gap-4 text-sm">
+              <span className="min-w-0">
+                <span className="font-medium">{item.productName}</span>
+                {item.quantity > 1 ? (
+                  <span className="text-black/50 dark:text-white/50"> × {item.quantity}</span>
+                ) : null}
+              </span>
+              <span className="shrink-0 tabular-nums">{item.totalPrice}</span>
+            </li>
+          ))}
+        </ul>
+
+        <div className="mt-3 flex items-baseline justify-between gap-4 border-t border-black/5 pt-3 dark:border-white/10">
+          <span className="text-sm font-medium">Total</span>
+          <span className="text-2xl font-semibold tabular-nums">
+            {order.currency} {order.total}
+          </span>
         </div>
       </div>
 
@@ -181,12 +234,16 @@ export function PayCheckout({
             })}
           </div>
 
-          {resolved && methods.length === 1 && methods[0] === PaymentMethod.CARD ? (
-            <p className="mt-4 text-xs leading-relaxed text-black/45 dark:text-white/45">
-              Apple Pay and Google Pay are not available for this merchant account yet, so card is
-              the only option. Nothing is hidden from you — a wallet button appears here as soon as
-              AFS enables it and your device supports it.
-            </p>
+          {resolved && !methods.includes(PaymentMethod.APPLE_PAY) && !methods.includes(PaymentMethod.GOOGLE_PAY) ? (
+            <div className="mt-4 space-y-1 text-xs leading-relaxed text-black/45 dark:text-white/45">
+              {[PaymentMethod.APPLE_PAY, PaymentMethod.GOOGLE_PAY]
+                .map((method) => ({ method, note: walletNote(method, reasons[method]) }))
+                .filter((entry) => entry.note !== null)
+                .map((entry) => (
+                  <p key={entry.method}>{entry.note}</p>
+                ))}
+              <p>Nothing is hidden from you — a wallet button appears here the moment it can work.</p>
+            </div>
           ) : null}
         </div>
       ) : null}
@@ -209,8 +266,10 @@ export function PayCheckout({
       {phase === "widget" && checkout ? (
         <div className="mt-4 rounded-2xl border border-black/10 bg-white p-5 shadow-sm dark:border-white/15 dark:bg-neutral-900">
           <p className="mb-3 text-xs text-black/50 dark:text-white/50">
-            Order #{checkout.orderNumber} · paying with {PAYMENT_METHOD_LABEL[checkout.method]}. Your
-            card details go straight to AFS.
+            Paying with {PAYMENT_METHOD_LABEL[checkout.method]}.{" "}
+            {checkout.method === PaymentMethod.CARD
+              ? "Your card details go straight to AFS."
+              : "Your card details stay in your wallet; AFS receives a one-time token."}
           </p>
           {/* Rendered and controlled by paymentWidgets.js. */}
           <form

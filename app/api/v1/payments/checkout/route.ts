@@ -13,11 +13,12 @@ export const dynamic = "force-dynamic";
 /**
  * POST /api/v1/payments/checkout
  *
- * Body: { machineToken, orderId, method }
+ * Body: { payToken, method }
  *
- * Creates the provider checkout for an existing order and returns only what
- * the browser needs to render the payment widget. The amount is read from the
- * order; the access token stays on the server.
+ * The pay token comes from the QR the machine printed and resolves to one
+ * already-priced order. Creates the provider checkout for it and returns only
+ * what the browser needs to render the payment widget. The amount is read from
+ * the order; the access token stays on the server.
  */
 export async function POST(request: NextRequest) {
   const body = await readJsonBody(request);
@@ -30,16 +31,15 @@ export async function POST(request: NextRequest) {
     return badRequest("Invalid checkout request.", formatZodIssues(parsed.error));
   }
 
-  const { machineToken, orderId, method } = parsed.data;
+  const { payToken, method } = parsed.data;
 
   try {
     const appBaseUrl = getAppBaseUrl(request);
     const { order, checkout } = await startOrderPayment({
-      machineToken,
-      orderId,
+      payToken,
       method,
       // AFS redirects here after the payment; the page verifies server-side.
-      shopperResultUrl: `${appBaseUrl}/pay/${machineToken}/result`,
+      shopperResultUrl: `${appBaseUrl}/pay/${payToken}/result`,
       customerIp: clientIpv4(request),
     });
 
@@ -60,9 +60,10 @@ export async function POST(request: NextRequest) {
     );
   } catch (error) {
     const { status, message } = orderErrorStatus(error);
+    // The pay token is a bearer credential for one order, so it is never
+    // logged — only the fact that a checkout for some token failed.
     logPaymentError("order.checkout.failed", {
       status,
-      orderId,
       method,
       message: error instanceof Error ? error.message : String(error),
     });

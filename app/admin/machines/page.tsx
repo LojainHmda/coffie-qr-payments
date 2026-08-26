@@ -1,51 +1,38 @@
 import Link from "next/link";
-import QRCode from "qrcode";
 
 import { CopyButton } from "@/components/admin/CopyButton";
-import { listMachines } from "@/lib/catalog/machines";
-import { isUnreachableFromPhone, machinePayUrl, resolveQrBaseUrl } from "@/lib/qr/url";
+import { demoKeysInUse, listMachines } from "@/lib/catalog/machines";
+import { isUnreachableFromPhone, resolveQrBaseUrl } from "@/lib/qr/url";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export const metadata = {
-  title: "Machine QR codes",
+  title: "Machines",
 };
 
 /**
- * Development/demo page: one printable QR per machine.
+ * Machine registry.
  *
- * The QR is rendered to SVG on the server, so nothing is fetched from a QR
- * image service and no QR library reaches the browser bundle.
- *
- * Each QR encodes the machine's opaque public token, never its id or its
- * MACHINE-00x code.
+ * There is deliberately no QR on this page. A QR is per-ORDER now, not per
+ * machine: it exists only once a customer has chosen their drinks on the
+ * machine, and it dies with that order. What this page offers instead is a way
+ * into each machine's screen.
  */
 export default async function MachinesPage() {
   const baseUrl = await resolveQrBaseUrl();
   const machines = listMachines();
   const unreachable = isUnreachableFromPhone(baseUrl);
-
-  const cards = await Promise.all(
-    machines.map(async (machine) => {
-      const url = machinePayUrl(baseUrl, machine.publicToken);
-      const svg = await QRCode.toString(url, {
-        type: "svg",
-        errorCorrectionLevel: "M",
-        margin: 1,
-        width: 240,
-      });
-      return { machine, url, svg };
-    }),
-  );
+  const demoKeys = demoKeysInUse();
 
   return (
     <main className="min-h-dvh bg-neutral-50 px-4 py-8 dark:bg-neutral-950">
       <div className="mx-auto w-full max-w-5xl">
         <header className="mb-6">
-          <h1 className="text-xl font-semibold tracking-tight">Machine QR codes</h1>
+          <h1 className="text-xl font-semibold tracking-tight">Machines</h1>
           <p className="mt-1 text-sm text-black/60 dark:text-white/60">
-            Scan one with your phone camera to open that machine&rsquo;s payment page.
+            Open a machine&rsquo;s screen to place an order the way a customer would. The machine
+            prints the QR; the phone only pays.
           </p>
           <nav className="mt-3 text-sm">
             <Link href="/admin/orders" className="underline underline-offset-4">
@@ -55,46 +42,63 @@ export default async function MachinesPage() {
         </header>
 
         {unreachable ? (
+          <p className="mb-4 rounded-xl bg-amber-50 p-4 text-sm text-amber-900 dark:bg-amber-500/10 dark:text-amber-200">
+            This page is open at <code className="font-mono">{baseUrl}</code>, which a phone cannot
+            reach — so the QR a machine prints would not be scannable either. Open it at your
+            computer&rsquo;s LAN address instead, for example{" "}
+            <code className="font-mono">http://192.168.1.45:3000/admin/machines</code>, with both
+            devices on the same Wi-Fi.
+          </p>
+        ) : null}
+
+        {demoKeys.length > 0 ? (
           <p className="mb-6 rounded-xl bg-amber-50 p-4 text-sm text-amber-900 dark:bg-amber-500/10 dark:text-amber-200">
-            These QR codes point at <code className="font-mono">{baseUrl}</code>, which your phone
-            cannot reach. Open this page using your computer&rsquo;s LAN address instead — for
-            example <code className="font-mono">http://192.168.1.45:3000/admin/machines</code> — and
-            the codes will regenerate with an address the phone can open. Both devices must be on
-            the same Wi-Fi.
+            {demoKeys.join(", ")} {demoKeys.length === 1 ? "is" : "are"} still using the API key
+            committed to this repository. Set <code className="font-mono">MACHINE_API_KEYS</code>{" "}
+            before any machine talks to a real deployment.
           </p>
         ) : null}
 
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {cards.map(({ machine, url, svg }) => (
-            <section
-              key={machine.id}
-              className="rounded-2xl border border-black/10 bg-white p-5 shadow-sm dark:border-white/15 dark:bg-neutral-900"
-            >
-              <h2 className="text-base font-semibold tracking-tight">{machine.code}</h2>
-              <p className="text-xs text-black/50 dark:text-white/50">{machine.location}</p>
+          {machines.map((machine) => {
+            const terminalUrl = `${baseUrl}/machine/${machine.code}`;
+            return (
+              <section
+                key={machine.id}
+                className="rounded-2xl border border-black/10 bg-white p-5 shadow-sm dark:border-white/15 dark:bg-neutral-900"
+              >
+                <h2 className="text-base font-semibold tracking-tight">{machine.code}</h2>
+                <p className="text-xs text-black/50 dark:text-white/50">{machine.location}</p>
 
-              <div
-                className="mx-auto mt-4 w-full max-w-[240px] rounded-xl bg-white p-3 [&>svg]:h-auto [&>svg]:w-full"
-                // Generated by the qrcode package from our own URL string.
-                dangerouslySetInnerHTML={{ __html: svg }}
-              />
-
-              <p className="mt-4 font-mono text-[11px] break-all text-black/50 dark:text-white/50">
-                {url}
-              </p>
-
-              <div className="mt-3 flex items-center gap-2">
-                <CopyButton value={url} />
-                <a
-                  href={url}
-                  className="rounded-lg border border-black/15 px-3 py-1.5 text-xs font-medium transition-colors active:bg-black/5 dark:border-white/20 dark:active:bg-white/10"
+                <Link
+                  href={`/machine/${machine.code}`}
+                  className="mt-4 flex min-h-12 w-full items-center justify-center rounded-xl bg-black text-sm font-medium text-white dark:bg-white dark:text-black"
                 >
-                  Open
-                </a>
-              </div>
-            </section>
-          ))}
+                  Open machine screen
+                </Link>
+
+                <p className="mt-3 font-mono text-[11px] break-all text-black/50 dark:text-white/50">
+                  {terminalUrl}
+                </p>
+
+                <div className="mt-3 flex items-center gap-2">
+                  <CopyButton value={terminalUrl} />
+                  <Link
+                    href={`/admin/orders?machine=${machine.id}`}
+                    className="rounded-lg border border-black/15 px-3 py-1.5 text-xs font-medium transition-colors active:bg-black/5 dark:border-white/20 dark:active:bg-white/10"
+                  >
+                    Orders
+                  </Link>
+                </div>
+              </section>
+            );
+          })}
         </div>
+
+        <p className="mt-6 text-xs leading-relaxed text-black/40 dark:text-white/40">
+          Machine API keys are never shown here. The machine screen talks to the server through
+          server actions, so no machine credential is sent to a browser.
+        </p>
       </div>
     </main>
   );

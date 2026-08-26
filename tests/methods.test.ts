@@ -43,8 +43,17 @@ describe("merchantEnabledMethods", () => {
 
 describe("brandsForMethod", () => {
   it("maps our methods onto Copy&Pay brand tokens", () => {
-    expect(brandsForMethod(PaymentMethod.CARD)).toBe("VISA MASTER");
-    expect(brandsForMethod(PaymentMethod.APPLE_PAY)).toBe("APPLEPAY");
-    expect(brandsForMethod(PaymentMethod.GOOGLE_PAY)).toBe("GOOGLEPAY");
+    expect(brandsForMethod(PaymentMethod.CARD, {})).toBe("VISA MASTER");
+    expect(brandsForMethod(PaymentMethod.APPLE_PAY, {})).toBe("APPLEPAY");
+    expect(brandsForMethod(PaymentMethod.GOOGLE_PAY, {})).toBe("GOOGLEPAY");
+  });
+
+  it("switches to the token brands when the acquirer decrypts", () => {
+    const env = { AFS_WALLET_DECRYPTION: "ACQUIRER" };
+
+    expect(brandsForMethod(PaymentMethod.APPLE_PAY, env)).toBe("APPLEPAYTKN");
+    expect(brandsForMethod(PaymentMethod.GOOGLE_PAY, env)).toBe("GOOGLEPAYTKN");
+    // Card is unaffected: there is no token variant of a card payment.
+    expect(brandsForMethod(PaymentMethod.CARD, env)).toBe("VISA MASTER");
   });
 });

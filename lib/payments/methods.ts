@@ -44,14 +44,31 @@ import { PaymentMethod } from "./payment";
  * Then set AFS_WALLET_METHODS=APPLE_PAY,GOOGLE_PAY (or either one) and the
  * buttons appear for the devices that also pass the browser check in
  * components/pay/useAvailablePaymentMethods.ts.
+ *
+ * The widget-side configuration both wallets need — Apple's total,
+ * supportedNetworks and merchantIdentifier, Google's mandatory
+ * gatewayMerchantId — is built in lib/payments/wallets.ts and applied to
+ * window.wpwlOptions in components/pay/wpwlOptions.ts.
  * ---------------------------------------------------------------------------
  */
 
-/** Copy&Pay brand tokens, for the widget's `data-brands` attribute. */
+/**
+ * Copy&Pay brand tokens, for the widget's `data-brands` attribute.
+ *
+ * The wallet entries have two forms. APPLEPAY / GOOGLEPAY mean AFS decrypts the
+ * wallet token; APPLEPAYTKN / GOOGLEPAYTKN mean the acquirer does.
+ * AFS_WALLET_DECRYPTION picks between them and defaults to the AFS-decrypts
+ * form, which is the one that needs no extra acquirer configuration.
+ */
 const BRANDS: Record<PaymentMethod, string> = {
   CARD: "VISA MASTER",
   APPLE_PAY: "APPLEPAY",
   GOOGLE_PAY: "GOOGLEPAY",
+};
+
+const ACQUIRER_BRANDS: Partial<Record<PaymentMethod, string>> = {
+  APPLE_PAY: "APPLEPAYTKN",
+  GOOGLE_PAY: "GOOGLEPAYTKN",
 };
 
 const WALLET_METHODS = new Set<PaymentMethod>([PaymentMethod.APPLE_PAY, PaymentMethod.GOOGLE_PAY]);
@@ -80,6 +97,12 @@ export function isMethodEnabled(
 }
 
 /** Copy&Pay `data-brands` value for a chosen method. */
-export function brandsForMethod(method: PaymentMethod): string {
+export function brandsForMethod(
+  method: PaymentMethod,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (env.AFS_WALLET_DECRYPTION?.trim().toUpperCase() === "ACQUIRER") {
+    return ACQUIRER_BRANDS[method] ?? BRANDS[method];
+  }
   return BRANDS[method];
 }

@@ -1,9 +1,7 @@
-import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { PayShell } from "@/components/pay/PayShell";
-import { getMachineByPublicToken } from "@/lib/catalog/machines";
-import { verifyOrderPayment, type OrderPaymentResult } from "@/lib/orders/checkout";
+import { OrderError, resolveScannedOrder, verifyOrderPayment, type OrderPaymentResult } from "@/lib/orders/checkout";
 import { logPaymentError } from "@/lib/payments/log";
 import { PAYMENT_METHOD_LABEL, PaymentStatus } from "@/lib/payments/payment";
 
@@ -20,7 +18,8 @@ export const metadata = {
  * AFS redirects the browser here with `?resourcePath=/v1/checkouts/{id}/payment`.
  * Landing on this page proves nothing: the status below comes from a
  * server-to-server call to AFS made during this render, and only that call is
- * allowed to mark the order PAID.
+ * allowed to mark the order PAID — which is in turn the only thing that tells
+ * the machine to pour.
  *
  * Refreshing is safe. The verification short-circuits on an already-settled
  * payment, and an order cannot leave PAID, so a reload produces the same
@@ -33,8 +32,15 @@ export default async function PayResultPage({
   const { token } = await params;
   const query = await searchParams;
 
-  const machine = getMachineByPublicToken(token);
-  if (!machine) notFound();
+  let scanned;
+  try {
+    scanned = resolveScannedOrder(token);
+  } catch (error) {
+    if (error instanceof OrderError && error.httpStatus === 404) notFound();
+    throw error;
+  }
+
+  const { order: scannedOrder, machine } = scanned;
 
   const raw = query.resourcePath;
   const resourcePath = Array.isArray(raw) ? raw[0] : raw;
@@ -53,9 +59,10 @@ export default async function PayResultPage({
 
   let outcome: OrderPaymentResult | null = null;
   try {
-    outcome = await verifyOrderPayment({ machineToken: token, resourcePath });
+    outcome = await verifyOrderPayment({ payToken: token, resourcePath });
   } catch (error) {
     logPaymentError("pay.result.verification_failed", {
+      orderId: scannedOrder.id,
       machineId: machine.id,
       message: error instanceof Error ? error.message : String(error),
     });
@@ -74,7 +81,6 @@ export default async function PayResultPage({
   }
 
   const { order, payment } = outcome;
-  const item = order.items[0];
 
   if (payment.status === PaymentStatus.PENDING) {
     // AFS has the attempt but has not settled it (000.200.xxx). Saying
@@ -115,21 +121,21 @@ export default async function PayResultPage({
         <p className="mt-1 text-sm text-black/60 dark:text-white/60">Order #{order.orderNumber}</p>
 
         <div className="mt-5 border-t border-black/5 pt-4 text-left dark:border-white/10">
-          <Row label={item?.productName ?? "Order"} value={`${order.currency} ${order.total}`} strong />
+          {order.items.map((item) => (
+            <Row
+              key={item.productId}
+              label={item.quantity > 1 ? `${item.productName} × ${item.quantity}` : item.productName}
+              value={item.totalPrice}
+            />
+          ))}
+          <div className="mt-1 border-t border-black/5 pt-2 dark:border-white/10">
+            <Row label="Total" value={`${order.currency} ${order.total}`} strong />
+          </div>
           <Row label="Paid with" value={PAYMENT_METHOD_LABEL[payment.method]} />
           <Row label="Machine" value={machine.code} />
         </div>
 
-        <p className="mt-5 text-sm font-medium">Thank you.</p>
-      </div>
-
-      <div className="mt-4 text-center">
-        <Link
-          href={`/pay/${token}`}
-          className="inline-block py-2 text-xs text-black/50 underline underline-offset-4 dark:text-white/50"
-        >
-          Buy something else
-        </Link>
+        <p className="mt-5 text-sm font-medium">Collect your drink at the machine.</p>
       </div>
     </PayShell>
   );
@@ -151,13 +157,16 @@ const VARIANTS = {
     mark: "⏳",
     title: "Payment Pending",
     reassurance: null,
-    action: "Start over",
+    action: "Reload",
   },
 } as const;
 
 /**
  * Customers get a plain sentence and a way forward. AFS result codes and
  * gateway diagnostics stay in the server log, where they are useful.
+ *
+ * "Try again" returns to this order's own payment page, not to a menu: the
+ * order is already rung up on the machine and must not be built twice.
  */
 function Outcome({
   machineCode,

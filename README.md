@@ -11,34 +11,63 @@ It is **TEST environment only**. No real money moves.
 
 ## Current scope
 
-**QR payment flow** — the customer scans a machine QR with their phone camera,
-picks a drink, pays through AFS, and the owner sees the order.
+**Machine-first ordering** — the customer chooses their drinks *on the machine*.
+The machine asks this server to price and record the order, then prints a QR for
+that one order. The phone that scans it can do exactly one thing: pay.
 
 ```
-QR -> Machine -> Order -> Product -> Payment -> AFS transaction
+Machine screen -> Order (priced here) -> per-order QR
+                                            |
+                                       phone scans
+                                            |
+                                    Payment -> AFS transaction
+                                            |
+                             machine polls -> dispense
 ```
 
-- Three demo machines, each with its own opaque QR token.
-- Server-rendered QR codes on an admin page.
-- Mobile-first product selection and payment pages.
-- Server-owned pricing: the browser sends a product id, never a price.
+- The QR is **per order, not per machine**. It carries one opaque pay token,
+  expires (15 minutes by default), and is useless once the order is paid.
+- Machines are authenticated API clients: an order is attributed to whoever
+  holds the key, and no request body can claim a different machine.
+- Multi-drink baskets with quantities, totalled in integer minor units so no
+  floating-point drift ever reaches AFS.
+- Server-owned pricing: the machine sends product ids and counts, never a price.
+  The phone sends neither.
 - Payment-method abstraction (CARD / APPLE_PAY / GOOGLE_PAY) that offers only
   what AFS has actually provisioned — today that is card only.
 - Prepare an AFS checkout server-to-server (`POST /v1/checkouts`).
 - Render the official AFS Copy&Pay widget in the browser.
 - Verify the outcome server-to-server (`GET /v1/checkouts/{id}/payment`).
 - Idempotent verification: refreshing the result page cannot duplicate an order.
+- The machine is told to dispense only after that server-side verification —
+  never because a phone reached a success screen.
 - Owner dashboard with machine and status filters.
 - A webhook endpoint that is reachable and ready for AFS to configure.
 
 ## Not included yet
 
-Coffee machine hardware integration · dispensing · inventory · stock ·
-production payments · customer accounts · refunds · subscriptions · database
-persistence · authentication on the admin pages.
+Real coffee machine hardware · dispensing · inventory · stock · production
+payments · customer accounts · refunds · subscriptions · database persistence ·
+authentication on the admin pages or the machine screen.
 
 **Orders and payments are held in memory.** Restarting the dev server clears
-them. The QR tokens are hard-coded, so printed QR codes keep working.
+them, and with them every outstanding pay token.
+
+---
+
+## The flow, and who is allowed to say what
+
+| Step | Who | May state | May never state |
+| --- | --- | --- | --- |
+| Choose drinks | customer, on the machine | — | — |
+| Create order | machine (API key) | product ids, quantities | its own identity, any price |
+| Show QR | machine | — | the pay token as readable text |
+| Pay | customer's phone | pay token, payment method | machine, product, order id, amount |
+| Settle | this server, talking to AFS | everything | — |
+| Dispense | machine (polling) | — | — |
+
+The customer's phone holds one opaque token that resolves to one already-priced
+order. There is nothing left in the payment request to tamper with.
 
 ---
 
@@ -46,12 +75,34 @@ them. The QR tokens are hard-coded, so printed QR codes keep working.
 
 | Path | Who | What |
 | --- | --- | --- |
-| `/admin/machines` | you | One QR per machine, with its URL and a copy button |
-| `/admin/orders` | owner | Every order: machine, product, amount, method, status, AFS transaction id |
-| `/pay/{machineToken}` | customer | Drinks available at the scanned machine |
-| `/pay/{machineToken}/checkout?productId=` | customer | Price, payment methods, Copy&Pay widget |
-| `/pay/{machineToken}/result` | customer | shopperResultUrl target; verifies with AFS and shows the outcome |
+| `/machine/{code}` | the machine | The machine's own screen: choose drinks, print the QR, wait for payment, dispense |
+| `/admin/machines` | you | Machine registry and a link into each machine's screen |
+| `/admin/orders` | owner | Every order: machine, items, amount, method, status, AFS transaction id |
+| `/pay/{payToken}` | customer | The scanned order: its items, its total, and the ways to pay |
+| `/pay/{payToken}/result` | customer | shopperResultUrl target; verifies with AFS and shows the outcome |
 | `/payment-test` | you | The original fixed-amount AFS harness, kept for regressions |
+
+## Machine API
+
+For real hardware. The simulator at `/machine/{code}` uses server actions
+instead, so no machine key is ever sent to a browser.
+
+```bash
+# Ring up an order
+curl -X POST http://localhost:3000/api/v1/machine/orders \
+  -H "Authorization: Bearer $MACHINE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"lines":[{"productId":"prd_coffee","quantity":2}]}'
+# -> { orderId, orderNumber, total, currency, payToken, payUrl, qrSvg, expiresAt }
+
+# Poll until it is time to pour
+curl http://localhost:3000/api/v1/machine/orders/$ORDER_ID \
+  -H "Authorization: Bearer $MACHINE_KEY"
+# -> { status, total, currency, items, dispense }
+```
+
+`dispense` turns true only after this server has verified the payment with AFS.
+A machine can only read its own orders, even with a valid key.
 
 ---
 
@@ -61,16 +112,25 @@ Both devices must be on the same Wi-Fi.
 
 1. `npm run dev` — Next.js already listens on every interface.
 2. Find your LAN address (`ipconfig` on Windows, e.g. `192.168.1.45`).
-3. On your computer, open **http://<lan-ip>:3000/admin/machines**.
-   Opening it at that address is what makes the QR codes encode it too; the
-   page warns you if they still point at localhost.
-4. Scan a QR with the phone's normal camera app. No app install.
-5. Pick Coffee — AED 3.00.
-6. Choose a payment method. Only Card appears, because that is the only method
-   AFS has provisioned (see **Payment methods** below).
+3. On your computer, open the machine's screen at
+   **http://<lan-ip>:3000/machine/MACHINE-001**.
+   Opening it at that address is what makes the QR encode it too; the screen
+   warns you if the code still points at localhost.
+4. Choose drinks with the + buttons — say two Coffees — and tap **Checkout**.
+   The machine screen now shows a QR and the total, AED 6.00.
+5. Scan that QR with the phone's normal camera app. No app install.
+6. The phone shows the order you just rang up. There is nothing to choose:
+   only how to pay. Only Card appears, because that is the only method AFS has
+   provisioned (see **Payment methods** below).
 7. Pay with an AFS test card; complete the 3-D Secure challenge if prompted.
-8. You land on the result page, which verifies with AFS server-side.
-9. Open **http://<lan-ip>:3000/admin/orders** to see the order.
+8. The phone lands on the result page, which verifies with AFS server-side.
+9. Watch the machine screen: within a couple of seconds it flips to
+   **Payment received / Dispensing your drink**. That came from polling the
+   server, not from the phone.
+10. Open **http://<lan-ip>:3000/admin/orders** to see the order.
+
+Leave the QR unpaid for 15 minutes and both screens say so — the code expires,
+and the phone explains that nothing was charged.
 
 If Windows Firewall blocks the connection, allow inbound TCP 3000 for private
 networks.
@@ -120,82 +180,158 @@ returns `000.200.100`. AFS does not validate brand provisioning at checkout
 creation, so **that response is not evidence of wallet support.** The resolved
 widget brand list is.
 
-**Conclusion: Apple Pay and Google Pay are not available today.** The app shows
-card only, and says so on screen rather than hiding it.
+**Conclusion: as last probed, Apple Pay and Google Pay were not provisioned.**
+Until AFS enables them the app shows card only, and says on screen why each
+wallet is missing rather than leaving a silent gap.
+
+### The wallet integration itself is built
+
+All three methods are implemented end to end, so enabling a wallet is
+configuration, not code:
+
+| Path | Purpose |
+| --- | --- |
+| `lib/payments/methods.ts` | Merchant gate + the `data-brands` token per method |
+| `lib/payments/wallets.ts` | Builds the browser-safe Apple Pay / Google Pay config |
+| `components/pay/wpwlOptions.ts` | Turns that config into `window.wpwlOptions` |
+| `components/pay/useAvailablePaymentMethods.ts` | Device gate, with a reason per wallet |
+
+A wallet button is not just `APPLEPAY` in `data-brands`. The Copy&Pay widget
+wraps the Apple Pay JS API and the Google Pay API, and both need merchant
+configuration that AFS cannot infer from the checkout — Apple's `total`,
+`currencyCode`, `countryCode`, `supportedNetworks` and `merchantCapabilities`;
+Google's **mandatory** `gatewayMerchantId`. That is what
+`lib/payments/wallets.ts` produces and `wpwlOptions.ts` applies, before the
+widget script loads (it reads the global exactly once at boot).
+
+Two details worth knowing:
+
+- The Apple Pay sheet's total comes from the **checkout the server created**,
+  not from the price this page rendered, so the sheet always shows what AFS
+  will actually charge.
+- `googlePay.gatewayMerchantId` is the AFS entity id, so the entity id — and
+  only the entity id — is sent to the browser. The access token is not read by
+  that module at all, and a unit test asserts it never appears in the payload.
 
 ### To enable Apple Pay
 
 1. AFS enables the `APPLEPAY` brand on the entity.
-2. Apple Merchant ID plus a payment-processing certificate exchanged with AFS.
-3. Every serving domain registered with Apple **and** serving
+2. Certificates. Either use AFS's (Open Payment Platform → Administration →
+   Mobile Payment → *Apple Pay Web Merchant Registration*: host the
+   domain-verification file, register the domain — no Apple developer account
+   needed), or your own Merchant ID plus a Payment Processing Certificate and a
+   Merchant Identity Certificate generated from the CSRs OPP issues.
+3. Every serving domain registered — with AFS, or with Apple if you brought
+   your own certificates — and serving
    `/.well-known/apple-developer-merchantid-domain-association`.
 4. HTTPS on a public domain. A LAN address can never show Apple Pay.
-5. Safari / iOS WebKit only.
+5. Safari / iOS WebKit, or any browser on iOS 18 when
+   `AFS_APPLE_PAY_MERCHANT_ID` is set (that switches the availability check to
+   Apple's `applePayCapabilities`, which also reports whether the customer has
+   a card that can pay on the web).
 
 ### To enable Google Pay
 
-1. AFS enables the `GOOGLEPAY` brand and supplies the gateway merchant id.
-2. A Google Pay Business Console merchant id (TEST works before approval).
-3. HTTPS — the API requires a secure context.
-4. Chrome / Chromium / Android.
+1. AFS enables the `GOOGLEPAY` brand on the entity.
+2. `AFS_ENTITY_ID` — already configured; it is sent as `gatewayMerchantId`.
+3. A Google Pay Business Console merchant id for production
+   (`AFS_GOOGLE_PAY_MERCHANT_ID`). TEST works before approval.
+4. HTTPS — the API requires a secure context.
+5. Chrome / Chromium / Android.
 
-Then set `AFS_WALLET_METHODS=APPLE_PAY,GOOGLE_PAY` (or either). Because both
-need HTTPS, a wallet cannot be demoed over the LAN address — that needs a
-tunnel (`cloudflared tunnel --url http://localhost:3000`) with `APP_BASE_URL`
-set to the https URL.
+Then set `AFS_WALLET_METHODS=APPLE_PAY,GOOGLE_PAY` (or either) and check the
+wallet variables in `.env.local.example`. If the acquirer decrypts the wallet
+token rather than AFS, set `AFS_WALLET_DECRYPTION=ACQUIRER` — the brands become
+`APPLEPAYTKN` / `GOOGLEPAYTKN` and Google Pay additionally needs
+`AFS_GOOGLE_PAY_GATEWAY`.
+
+Because both wallets need HTTPS, neither can be demoed over the LAN address.
+Use the Cloud Run URL, or a tunnel
+(`cloudflared tunnel --url http://localhost:3000`) with `APP_BASE_URL` set to
+the https URL.
+
+A wallet named in `AFS_WALLET_METHODS` but missing what it needs degrades to
+"no button" rather than to a broken page, and logs `wallet.config.incomplete`
+saying what is missing.
 
 ---
 
 ## Architecture
 
 ```
-Browser (/payment-test)
-   │  1. POST /api/v1/payments/afs/checkout        (no amount in the request)
+COFFEE MACHINE (/machine/{code})
+   │  customer picks drinks on the machine itself
+   │  1. POST /api/v1/machine/orders     Authorization: Bearer <machine key>
+   │     { lines: [{ productId, quantity }] }        (no prices in the request)
    ▼
-Next.js API route  ──2. POST https://eu-test.oppwa.com/v1/checkouts──▶  AFS
+Next.js  ── resolves the machine FROM THE KEY, prices each line from the
+   │        catalogue, totals in integer minor units, mints a pay token
+   │  2. { orderId, total, currency, payToken, payUrl, qrSvg, expiresAt }
+   ▼
+Machine prints a QR of  {base}/pay/{payToken}      ← per order, expires
+   │
+   │  customer scans it
+   ▼
+PHONE (/pay/{payToken})
+   │  shows the order the machine rang up; the only choice left is how to pay
+   │  3. POST /api/v1/payments/checkout   { payToken, method }
+   ▼
+Next.js API route  ──4. POST https://eu-test.oppwa.com/v1/checkouts──▶  AFS
    │                    Authorization: Bearer <AFS_ACCESS_TOKEN>          │
-   │                    entityId, amount=5.00, currency=AED,              │
+   │                    entityId, amount=<the ORDER's total>, currency,   │
    │                    paymentType=DB, merchantTransactionId,            │
    │                    customer.*/billing.* (3DS2), integrity=true       │
    │                    (NOT shopperResultUrl — see gotcha below)         │
-   │  ◀───────────────  3. { id: checkoutId, result.code: 000.200.100 } ──┘
+   │  ◀───────────────  5. { id: checkoutId, result.code: 000.200.100 } ──┘
    │
-   │  4. { checkoutId, amount, currency, widgetScriptUrl, integrity }
+   │  6. { checkoutId, amount, currency, widgetScriptUrl, integrity, brands }
    ▼
-Browser loads https://eu-test.oppwa.com/v1/paymentWidgets.js?checkoutId=…
-   │  5. AFS renders the card form; the form's action carries the
-   │     shopperResultUrl. Card data goes browser → AFS only.
+Phone loads https://eu-test.oppwa.com/v1/paymentWidgets.js?checkoutId=…
+   │  7. AFS renders the card form (or the wallet sheet); the form's action
+   │     carries the shopperResultUrl. Card data goes phone → AFS only.
    │     It never touches this application.
    │     3-D Secure challenge (if the card requires it) happens here.
    ▼
 AFS redirects to shopperResultUrl:
-   /payment-test/result?resourcePath=/v1/checkouts/{checkoutId}/payment
+   /pay/{payToken}/result?resourcePath=/v1/checkouts/{checkoutId}/payment
    │
    ▼
 Result page (server component)
-   │  6. GET https://eu-test.oppwa.com{resourcePath}?entityId=…  ──▶  AFS
+   │  8. GET https://eu-test.oppwa.com{resourcePath}?entityId=…  ──▶  AFS
    │  ◀── { id, amount, currency, result.code, paymentBrand } ──────┘
-   │  7. Classify the result code, check amount + currency match what the
-   │     server asked for, then render SUCCESS / FAILED.
+   │  9. Classify the result code, check amount + currency match what the
+   │     server asked for, check the checkout belongs to THIS order,
+   │     then mark the order PAID and render SUCCESS / FAILED.
    ▼
-SUCCESS or FAILED shown to the customer
+        ┌──────────────────────────────────────────┐
+        │ Meanwhile the machine has been polling   │
+        │ GET /api/v1/machine/orders/{orderId}     │
+        │ It sees dispense:true and pours.         │
+        └──────────────────────────────────────────┘
 
 (separately) AFS ──POST──▶ /api/v1/payments/afs/webhook   [not yet verified]
 ```
 
-**The redirect is never treated as proof of payment.** Only step 6 decides.
+**The redirect is never treated as proof of payment.** Only step 8 decides —
+and only step 8 is what eventually makes a drink come out.
 
 ### Where things live
 
 | Path | Purpose |
 | --- | --- |
-| `lib/catalog/machines.ts` | Machine registry + opaque QR token resolution |
+| `lib/catalog/machines.ts` | Machine registry + API-key identity (constant-time) |
 | `lib/catalog/products.ts` | Product catalogue — the only authority on price |
-| `lib/orders/order.ts` | `Order`, `OrderItem`, `OrderStatus` |
-| `lib/orders/store.ts` | In-memory order store (swap for a table later) |
-| `lib/orders/checkout.ts` | QR token -> order -> checkout -> verified payment |
+| `lib/orders/order.ts` | `Order`, `OrderItem`, `OrderStatus`, the pay window |
+| `lib/orders/store.ts` | In-memory order store + the payToken index |
+| `lib/orders/checkout.ts` | Machine basket -> order -> checkout -> verified payment -> dispense |
+| `lib/orders/money.ts` | Integer-minor-unit arithmetic; no float ever reaches AFS |
+| `lib/machines/auth.ts` | `Authorization: Bearer <machine key>` |
+| `lib/machines/orderQr.ts` | Renders an order's QR to SVG, server-side |
 | `lib/qr/url.ts` | Which base URL a QR should encode |
 | `lib/payments/methods.ts` | Which payment methods AFS has actually provisioned |
+| `lib/payments/wallets.ts` | Apple Pay / Google Pay widget configuration (browser-safe) |
+| `components/pay/wpwlOptions.ts` | Builds `window.wpwlOptions` for the chosen method |
+| `components/pay/useAvailablePaymentMethods.ts` | Device gate: can this browser really pay this way |
 | `lib/payments/payment.ts` | `PaymentStatus`, `PaymentMethod`, `PaymentRecord` — provider-independent |
 | `lib/payments/store.ts` | In-memory payment store, with the terminal-state guard |
 | `lib/payments/afs/client.ts` | The only place that talks HTTP to AFS |
@@ -205,10 +341,12 @@ SUCCESS or FAILED shown to the customer
 | `lib/payments/afs/config.ts` | Environment validation, `getAppBaseUrl` |
 | `lib/payments/log.ts` | Sanitised logging |
 | `lib/validation/payment.ts` | Zod request schemas |
-| `app/pay/[token]/**` | Customer QR flow |
-| `app/admin/**` | QR demo page and owner dashboard |
-| `app/api/v1/orders` | Create an order from a machine token + product id |
-| `app/api/v1/payments/checkout` | Create the AFS checkout for an order |
+| `app/machine/[code]/**` | The machine's screen and its server actions |
+| `app/pay/[token]/**` | Customer payment flow, keyed by pay token |
+| `app/admin/**` | Machine registry and owner dashboard |
+| `app/api/v1/machine/orders` | Machine creates an order (authenticated) |
+| `app/api/v1/machine/orders/[orderId]` | Machine polls it until `dispense` |
+| `app/api/v1/payments/checkout` | Create the AFS checkout for a scanned pay token |
 | `app/api/v1/payments/afs/status` | Server-side payment verification (JSON) |
 | `app/api/v1/payments/afs/webhook` | Receives AFS notifications |
 
@@ -247,8 +385,18 @@ cp .env.local.example .env.local
 | `AFS_CURRENCY` | no (default `AED`) | ISO 4217 code. |
 | `AFS_WEBHOOK_DECRYPTION_KEY` | not yet | 64 hex characters. AFS supplies it after they configure our webhook URL. Leave empty for now. |
 | `APP_BASE_URL` | no | Absolute public URL of this app. Leave empty locally — the Host header the client used is used instead, which is what makes the LAN flow work. |
-| `AFS_WALLET_METHODS` | no | Wallets AFS has provisioned: `APPLE_PAY`, `GOOGLE_PAY`. **Leave empty** — neither is enabled on the current entity. |
-| `QR_BASE_URL` | no | Forces the URL the QR codes encode. Leave empty; the QR page uses the address you opened it with. |
+| `AFS_WALLET_METHODS` | no | Wallets AFS has provisioned: `APPLE_PAY`, `GOOGLE_PAY`. Empty = card only. Set it only after AFS confirms the wallet is live on the entity. |
+| `AFS_WALLET_DISPLAY_NAME` | no (default `Coffee Machine`) | Merchant name on both wallet sheets, and the Apple Pay total's label. |
+| `AFS_WALLET_COUNTRY` | no (default `AE`) | ISO 3166 country for the Apple Pay sheet. |
+| `AFS_WALLET_NETWORKS` | no (default `VISA,MASTERCARD`) | Card networks offered in both wallets; translated to each vendor's spelling. |
+| `AFS_APPLE_PAY_MERCHANT_ID` | no | Apple Merchant ID. Empty = the entity id is used, which is right when AFS supplies the certificates. |
+| `AFS_GOOGLE_PAY_MERCHANT_ID` | production | Google Pay Business Console merchant id. Google requires it once the site is approved. |
+| `AFS_WALLET_DECRYPTION` | no (default `PLATFORM`) | `PLATFORM` (AFS decrypts) or `ACQUIRER` (`APPLEPAYTKN` / `GOOGLEPAYTKN`). |
+| `AFS_GOOGLE_PAY_GATEWAY` | with `ACQUIRER` | Payment provider configured for Google Pay, sent as `googlePay.gateway`. |
+| `AFS_WALLET_COLLECT_CONTACT` | no (default off) | Ask the wallet sheet for email + billing address and submit them with the payment. |
+| `QR_BASE_URL` | no | Forces the URL the QR codes encode. Leave empty; the machine screen uses the address you opened it with. |
+| `MACHINE_API_KEYS` | production | `MACHINE-001:key,MACHINE-002:key`. Without it every machine uses the demo key committed to this repo. |
+| `ORDER_PAY_WINDOW_MINUTES` | no (default `15`) | How long a printed QR can still start a payment. |
 
 Rules that are enforced, not just documented:
 
@@ -361,6 +509,25 @@ source of truth.
 
 ## Security notes
 
+- The machine authenticates with an API key and its identity comes ONLY from
+  that key. A request body naming a machine is rejected by `strictObject`, so a
+  machine cannot write orders against another machine.
+- API keys are compared in constant time over SHA-256 digests, and every
+  machine is checked even after a match, so neither the key's contents nor its
+  position in the registry leaks through timing.
+- The pay token is a bearer credential for exactly one order. It is never
+  logged, never returned to the machine after creation, and never rendered as
+  text on the machine screen — only inside the QR image.
+- The pay window (15 minutes) is enforced when a checkout is CREATED and never
+  when one is verified: a customer returning late from a 3-D Secure challenge
+  must still have their payment settled and their drink poured.
+- Verification checks that the AFS checkout belongs to the same order as the
+  scanned token, so a valid token cannot be used to settle someone else's
+  payment.
+- Order totals are computed in integer minor units. A floating-point total
+  would be rejected by AFS as an amount mismatch, or worse, silently accepted.
+- The machine dispenses on `dispense:true`, which is set only by the
+  server-to-server verification — never by the phone reaching a success screen.
 - 3-D Secure 2 needs customer/billing data on the checkout (`TEST_CUSTOMER` in
   `lib/payments/afs/constants.ts`); the widget supplies the card and browser
   data itself. Without it a challenge card cannot authenticate.
@@ -419,12 +586,17 @@ automatically. `APP_BASE_URL` / `QR_BASE_URL` override that if ever needed.
    notifications drive payment state.
 3. Persistence: replace `lib/payments/store.ts` with a real payments table. The
    in-memory store is lost on restart and is not shared between instances.
-4. Authentication on `/admin/*`. Both admin pages are wide open today.
+4. Authentication on `/admin/*` and `/machine/*`. All of them are wide open
+   today, so anyone who can reach the app can ring up an order on any machine.
+   Also set `MACHINE_API_KEYS`: the fallback keys are committed to this repo.
 5. HTTPS everywhere, plus rate limiting on the order and checkout endpoints —
    today anyone who can reach the app can create unlimited orders and checkouts.
-6. Wallet provisioning with AFS if Apple Pay / Google Pay are wanted (see
-   **Payment methods** above), which also forces a public https domain.
+6. Wallet provisioning with AFS if Apple Pay / Google Pay are wanted — the code
+   is done, the entity is not (see **Payment methods** above). Also forces a
+   public https domain, and for Apple Pay a registered domain-association file.
 7. Reconciliation and refunds, monitoring/alerting on `afs.*` log events, and a
    retention policy for payment records.
-8. Real machine provisioning: today the three demo machines and their QR tokens
-   are hard-coded in `lib/catalog/machines.ts`.
+8. Real machine provisioning and hardware integration: today the three demo
+   machines are hard-coded in `lib/catalog/machines.ts`, and `/machine/{code}`
+   is a browser stand-in for a screen that does not exist. Real hardware talks
+   to the machine API instead — see **Machine API** above.
