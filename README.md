@@ -43,12 +43,18 @@ Machine screen -> Order (priced here) -> per-order QR
   never because a phone reached a success screen.
 - Owner dashboard with machine and status filters.
 - A webhook endpoint that is reachable and ready for AFS to configure.
+- **The Jetinno IOT Payment Universal Interface**, so real Jetinno vending
+  hardware can drive this server: it prices its own basket, asks us for a QR
+  string, and is told the outcome on its own callback address. See below.
 
 ## Not included yet
 
-Real coffee machine hardware · dispensing · inventory · stock · production
-payments · customer accounts · refunds · subscriptions · database persistence ·
-authentication on the admin pages or the machine screen.
+Inventory · stock · production payments · customer accounts · refunds ·
+subscriptions · database persistence · authentication on the admin pages or
+the machine screen · reverse-scan (barcode) payments.
+
+Jetinno hardware is integrated at the protocol level and **has not been tested
+against a physical machine** — no credentials or device have been available.
 
 **Orders and payments are held in memory.** Restarting the dev server clears
 them, and with them every outstanding pay token.
@@ -103,6 +109,159 @@ curl http://localhost:3000/api/v1/machine/orders/$ORDER_ID \
 
 `dispense` turns true only after this server has verified the payment with AFS.
 A machine can only read its own orders, even with a valid key.
+
+---
+
+## Jetinno IOT Payment Universal Interface
+
+Real Jetinno vending hardware does not use the API above. It speaks its own
+protocol — *IOT Payment Universal Interface*, spec A5, April 2025 — and the
+direction is the opposite of what you might assume:
+
+> **Their machine is the client. This server is the server.**
+> The machine calls us. We never command the machine.
+
+```
+customer orders on the machine   (the MACHINE prices the basket)
+        |
+        v
+POST /api/v1/jetinno/getQrCode   { deviceNo, orderNo, orderAmount, notifyUrl }
+        |
+        v
+we answer  { qrCode: "https://host/pay/<token>" }
+        |
+        v
+the machine draws that string as a QR on its own screen
+        |
+        v
+customer scans -> our payment page -> AFS Copy&Pay -> verified server-side
+        |
+        v
+POST notifyUrl                   { payStatus: PAYSUCCESS, platBillNo }
+        |
+        v
+the machine pours, then POST /api/v1/jetinno/productdone { isFinish: SUCCESS }
+```
+
+### Why no gateway QR product is needed
+
+§3.1.3 caps the `qrCode` field at **128 characters** and says nothing about
+what goes in it. A pay URL is about 50. So the string we hand back is simply
+this app's existing payment page, and the whole Copy&Pay flow works inside
+Jetinno's protocol unchanged — no QR product has to be provisioned with AFS.
+
+If AFS provision one later, it is swapped in inside `qrCodeForOrder()` in
+`lib/jetinno/orders.ts` and nothing else in the flow changes.
+
+### What we implement, and what we call
+
+| Endpoint | Spec | Who calls | Status |
+| --- | --- | --- | --- |
+| `POST /api/v1/jetinno/getQrCode` | §3.1 | Jetinno → us | Working |
+| `POST /api/v1/jetinno/productdone` | §3.5 | Jetinno → us | Working |
+| `POST {notifyUrl}` | §3.3 | us → Jetinno | Working |
+| `POST /api/v1/jetinno/payBarCode` | §3.2 | Jetinno → us | Refuses, with a reason |
+| `POST /api/v1/jetinno/refund` | §3.4 | Jetinno → us | Validates, does not move money |
+
+`payBarCode` is reverse scan: the machine's scanner reads a barcode off the
+customer's phone and asks us to charge it. AFS Copy&Pay takes a card on a
+hosted form and has no endpoint that accepts a payment barcode, so there is
+nothing to charge. It authenticates and logs the request, then refuses. The
+alternative — answering `PAYING`, which §3.2.3 defines as "the result will
+arrive on the callback" — would strand the machine waiting for a callback that
+can never be sent.
+
+`refund` checks the signature, finds the order, and verifies the amount does
+not exceed what was paid, then refuses. Answering `SUCCESS` without having
+refunded anything would be the most dangerous line in this codebase.
+
+### Signatures
+
+Every message in both directions carries an uppercase MD5 over the message's
+own fields plus the shared `apikey` (§2.4). The apikey is never transmitted —
+it is only the tail of the string being hashed, which is what makes the
+signature a proof of possession. It is the **entire** authentication story for
+this interface: there is no second credential and no IP allowlist.
+
+`lib/jetinno/signature.ts` is verified against the worked example the
+specification publishes in §2.5, digest and all:
+
+```
+deviceNo=44401&notifyUrl=http://127.0.0.1&orderAmount=1000&orderNo=2017…
+  + DBRW17YE7FHKR72T   ->   A682A6DCDAE3843FDF2107C033574E21
+```
+
+That test is ground truth. If it ever fails, the fix is in our code, never in
+the expectation.
+
+Two details the specification leaves ambiguous, and how we read them:
+
+- **`payType`** is excluded from the signature in §3.1.2 and §3.2.2, and
+  included in §3.3.2. We sign accordingly, and *verify* leniently — a
+  signature is accepted if it matches any reading. That costs nothing: every
+  candidate is still keyed on the apikey, so a caller without it can produce
+  none of them.
+- **Extension fields.** §2.4 requires that fields added by a future firmware
+  still participate in verification, so the signature is checked against the
+  raw request body before any schema narrowing, and unknown keys are preserved
+  rather than rejected.
+
+### The pricing inversion
+
+Everywhere else in this app, **the server prices and the machine may not state
+a price.** Jetinno's protocol reverses that: §3.1.2 sends `orderAmount` in
+cents and offers no field in which a server could answer with a different
+number. That is their interface, not a choice we made.
+
+Two things stand behind the amount instead:
+
+1. the **signature**, which proves the message came from a holder of the apikey
+   and that the amount was not altered in flight;
+2. **`JETINNO_MAX_ORDER_MINOR`**, which catches an amount that is authentic but
+   absurd. A firmware decimal-point bug signs just as validly as a correct
+   price does.
+
+Orders carry `source: "JETINNO"` so the two pricing models stay
+distinguishable in the dashboard and in any later audit.
+
+### Paid but not poured
+
+`productdone` (§3.5) is the only place the physical world reaches this system.
+It answers the question nothing else can ask: the money moved, but did coffee
+come out?
+
+`isFinish: ERROR` on a paid order leaves the payment **valid** — the customer
+really was charged — and records a failed fulfilment against the order. That
+pair is what a refund gets decided from, and it is invisible if payment and
+fulfilment are collapsed into one field.
+
+### Delivering the callback
+
+The machine has been waiting since it drew the QR and §3.2.3 is explicit that
+the callback is its only channel. If that POST never lands, someone who paid
+is standing in front of a machine that will not pour.
+
+So it is **at-most-once but retried**: three attempts with backoff, and
+`notifiedAt` is stamped only after a machine returns `SUCCESS`. A 200 carrying
+`FAIL` is a refusal, not a delivery — treating it as one would guarantee we
+never told the machine again. Both the result page and the AFS webhook trigger
+it independently, and either may run first.
+
+### Configuration
+
+`JETINNO_USERNAME` and `JETINNO_APIKEY` are issued by Guangzhou Jetinno. With
+them unset the endpoints exist but refuse every request — they never fall back
+to accepting unsigned traffic. See `.env.local.example`.
+
+`APP_BASE_URL` is **required** here. The QR goes on a machine on a shop floor,
+which cannot reach a LAN address or `localhost`.
+
+### Still needed from Jetinno
+
+Credentials and the `deviceNo` values, from the platform at
+`saas.jetinno.com` — `username`, `apikey`, `merchantNo`, and the product-id
+mapping table (§4.2). All of it is configuration; no code changes when it
+arrives.
 
 ---
 
@@ -596,7 +755,9 @@ automatically. `APP_BASE_URL` / `QR_BASE_URL` override that if ever needed.
    public https domain, and for Apple Pay a registered domain-association file.
 7. Reconciliation and refunds, monitoring/alerting on `afs.*` log events, and a
    retention policy for payment records.
-8. Real machine provisioning and hardware integration: today the three demo
-   machines are hard-coded in `lib/catalog/machines.ts`, and `/machine/{code}`
-   is a browser stand-in for a screen that does not exist. Real hardware talks
-   to the machine API instead — see **Machine API** above.
+8. Real machine provisioning: the three demo machines are hard-coded in
+   `lib/catalog/machines.ts`, and `/machine/{code}` is a browser stand-in for a
+   screen that does not exist. Real hardware talks to the machine API, or — for
+   Jetinno units — to the interface in **Jetinno IOT Payment Universal
+   Interface** above, which still needs credentials and one physical machine to
+   be tested against.

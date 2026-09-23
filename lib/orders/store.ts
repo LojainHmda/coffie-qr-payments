@@ -1,7 +1,16 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
 import { shared, sharedCounter } from "@/lib/store/memory";
-import { OrderStatus, isTerminalOrderStatus, payWindowMs, type Order, type OrderItem } from "./order";
+import {
+  FulfilmentState,
+  OrderSource,
+  OrderStatus,
+  isTerminalOrderStatus,
+  payWindowMs,
+  type ExternalOrderRef,
+  type Order,
+  type OrderItem,
+} from "./order";
 
 /**
  * In-memory order store for the POC, mirroring lib/payments/store.ts.
@@ -19,6 +28,20 @@ const orders = shared("orders", () => new Map<string, Order>());
 
 /** payToken -> orderId. The QR carries the token; nothing else resolves it. */
 const payTokens = shared("orders.payTokens", () => new Map<string, string>());
+
+/**
+ * "SOURCE:theirOrderNo" -> orderId.
+ *
+ * A vendor's order number is unique on their side, so this index is what makes
+ * a retried request idempotent. Jetinno's machines retry on an 8-second
+ * timeout (§2.1), and a retry that minted a second order would put two of our
+ * orders behind one cup of coffee.
+ */
+const externalOrderNos = shared("orders.externalOrderNos", () => new Map<string, string>());
+
+function externalKey(source: OrderSource, orderNo: string): string {
+  return `${source}:${orderNo}`;
+}
 
 /** Matches the order numbers in the product brief, which start around #1042. */
 const orderNumber = sharedCounter("orders.nextNumber", 1042);
@@ -39,9 +62,12 @@ export function createOrder(params: {
   items: OrderItem[];
   total: string;
   currency: string;
+  source?: OrderSource;
+  external?: ExternalOrderRef | null;
 }): Order {
   const now = new Date();
   const timestamp = now.toISOString();
+  const source = params.source ?? OrderSource.MACHINE_API;
   const order: Order = {
     id: `ord_${randomUUID()}`,
     orderNumber: orderNumber.value++,
@@ -55,10 +81,26 @@ export function createOrder(params: {
     createdAt: timestamp,
     updatedAt: timestamp,
     paidAt: null,
+    source,
+    external: params.external ?? null,
+    fulfilment: FulfilmentState.PENDING,
+    notifiedAt: null,
   };
   orders.set(order.id, order);
   payTokens.set(order.payToken, order.id);
+  if (order.external) {
+    externalOrderNos.set(externalKey(source, order.external.orderNo), order.id);
+  }
   return order;
+}
+
+/** Resolve a vendor's own order number back to our order. */
+export function getOrderByExternalOrderNo(
+  source: OrderSource,
+  orderNo: string,
+): Order | undefined {
+  const orderId = externalOrderNos.get(externalKey(source, orderNo));
+  return orderId ? orders.get(orderId) : undefined;
 }
 
 export function getOrder(orderId: string): Order | undefined {
@@ -90,6 +132,39 @@ export function setOrderStatus(orderId: string, status: OrderStatus): Order | un
   return updated;
 }
 
+/**
+ * Record what the machine said about making the drink (§3.5).
+ *
+ * Unlike payment status this is not terminal-protected, because a machine may
+ * legitimately report ERROR after a partial pour and then SUCCESS on a retry.
+ */
+export function setOrderFulfilment(
+  orderId: string,
+  fulfilment: FulfilmentState,
+): Order | undefined {
+  const existing = orders.get(orderId);
+  if (!existing) return undefined;
+
+  const updated: Order = { ...existing, fulfilment, updatedAt: new Date().toISOString() };
+  orders.set(orderId, updated);
+  return updated;
+}
+
+/**
+ * Stamp an order as having had its payment result delivered to the vendor.
+ *
+ * Returns undefined when it was already stamped, which is how the caller keeps
+ * the callback at-most-once without holding a lock.
+ */
+export function markOrderNotified(orderId: string): Order | undefined {
+  const existing = orders.get(orderId);
+  if (!existing || existing.notifiedAt) return undefined;
+
+  const updated: Order = { ...existing, notifiedAt: new Date().toISOString() };
+  orders.set(orderId, updated);
+  return updated;
+}
+
 /** Newest first. Used by the owner dashboard. */
 export function listOrders(): Order[] {
   return [...orders.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -99,5 +174,6 @@ export function listOrders(): Order[] {
 export function resetOrderStore() {
   orders.clear();
   payTokens.clear();
+  externalOrderNos.clear();
   orderNumber.value = 1042;
 }

@@ -1,5 +1,6 @@
 import { getActiveProduct } from "@/lib/catalog/products";
 import { getMachineById, type Machine } from "@/lib/catalog/machines";
+import { notifyPaymentResult, payStatusFor } from "@/lib/jetinno/notify";
 import { prepareCheckout, verifyPaymentByResourcePath, type PreparedCheckout, type VerifiedPayment } from "@/lib/payments/afs/service";
 import { AfsError } from "@/lib/payments/afs/errors";
 import { logPayment } from "@/lib/payments/log";
@@ -7,7 +8,7 @@ import { isMethodEnabled } from "@/lib/payments/methods";
 import { PaymentMethod, PaymentStatus } from "@/lib/payments/payment";
 import { getPaymentsByOrderId } from "@/lib/payments/store";
 import { MoneyError, multiplyPrice, sumPrices } from "./money";
-import { OrderStatus, isPayWindowOpen, type Order, type OrderItem } from "./order";
+import { OrderSource, OrderStatus, isPayWindowOpen, type Order, type OrderItem } from "./order";
 import { createOrder, getOrder, getOrderByPayToken, setOrderStatus } from "./store";
 
 /**
@@ -253,7 +254,42 @@ export async function verifyOrderPayment(params: {
       ? setOrderStatus(scanned.id, OrderStatus.PAID)
       : settleUnsuccessful(scanned.id, payment.status);
 
-  return { order: order ?? scanned, machine, payment };
+  const settled = order ?? scanned;
+
+  // A vendor machine is still standing there waiting to be told. Only a
+  // decided outcome is reported: PENDING means the customer is mid-challenge,
+  // and telling a machine PAYERROR then would cancel a payment still in
+  // progress.
+  if (payment.status !== PaymentStatus.PENDING) {
+    await reportToVendor(settled, payment);
+  }
+
+  return { order: settled, machine, payment };
+}
+
+/**
+ * Deliver the payment result to the machine's own platform, when the order came
+ * from one (Jetinno §3.3).
+ *
+ * Never allowed to fail the caller. The customer's payment is already settled
+ * with AFS by this point, and a callback we could not deliver is a delivery
+ * problem — logged, and retried by the next trigger — not a reason to show
+ * someone who just paid an error page.
+ */
+async function reportToVendor(order: Order, payment: VerifiedPayment): Promise<void> {
+  if (order.source !== OrderSource.JETINNO) return;
+
+  try {
+    await notifyPaymentResult(order, {
+      payStatus: payStatusFor(payment.status === PaymentStatus.SUCCESS),
+      platBillNo: payment.transactionId,
+    });
+  } catch (error) {
+    logPayment("jetinno.callback.errored", {
+      orderId: order.id,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 /**

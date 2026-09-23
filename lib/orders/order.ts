@@ -26,6 +26,62 @@ export const OrderStatus = {
 
 export type OrderStatus = (typeof OrderStatus)[keyof typeof OrderStatus];
 
+/**
+ * Who created the order, which decides who priced it.
+ *
+ * MACHINE_API — our own interface. The machine names products and quantities,
+ * the server reads prices from the catalogue. The server is the only authority
+ * on what anything costs.
+ *
+ * JETINNO — the IOT Payment Universal Interface. Their machine prices its own
+ * basket and states `orderAmount` in the request. That is their protocol, not
+ * our choice: §3.1.2 has no shape in which the server could price anything.
+ * The MD5 signature over the apikey is what authenticates the amount, and
+ * `JETINNO_MAX_ORDER_MINOR` is the sanity bound behind it.
+ */
+export const OrderSource = {
+  MACHINE_API: "MACHINE_API",
+  JETINNO: "JETINNO",
+} as const;
+
+export type OrderSource = (typeof OrderSource)[keyof typeof OrderSource];
+
+/**
+ * An order's identity in the vendor platform that created it.
+ *
+ * `orderNo` is their number and is globally unique on their side, which makes
+ * it our idempotency key: a retried getQrCode must return the same QR, not a
+ * second order.
+ *
+ * `notifyUrl` is the single most important field here. It arrives per request
+ * (§3.1.2) and is where we POST the payment result (§3.3.1) — the machine
+ * tells us where to report, we do not configure it.
+ */
+export interface ExternalOrderRef {
+  deviceNo: string;
+  merchantNo: string | null;
+  orderNo: string;
+  notifyUrl: string | null;
+  payType: string | null;
+  attach: string | null;
+}
+
+/**
+ * Whether the machine actually made the drink, as reported by §3.5.
+ *
+ * Distinct from payment status on purpose: a paid order whose machine failed
+ * to pour is precisely the case that needs a refund, and it is invisible if
+ * the two are collapsed into one field.
+ */
+export const FulfilmentState = {
+  /** Not reported yet. Every order starts here. */
+  PENDING: "PENDING",
+  SUCCESS: "SUCCESS",
+  ERROR: "ERROR",
+} as const;
+
+export type FulfilmentState = (typeof FulfilmentState)[keyof typeof FulfilmentState];
+
 export interface OrderItem {
   productId: string;
   /** Snapshot: the catalogue may change after the order was placed. */
@@ -51,6 +107,14 @@ export interface Order {
   createdAt: string;
   updatedAt: string;
   paidAt: string | null;
+  /** Which interface created this order, and therefore who priced it. */
+  source: OrderSource;
+  /** Set only for orders that originated in a vendor platform. */
+  external: ExternalOrderRef | null;
+  /** What the machine reported about actually making the drink. */
+  fulfilment: FulfilmentState;
+  /** When we successfully delivered the payment result to `notifyUrl`. */
+  notifiedAt: string | null;
 }
 
 /** PAID is terminal: nothing may move an order back out of it. */
